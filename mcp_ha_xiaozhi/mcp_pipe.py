@@ -40,11 +40,11 @@ APP_OPTION_KEYS = (
 )
 
 LOCAL_TOOL_CURSOR_PREFIX = "xiaozhi-page:"
-# 小智固件的 MCP 工具列表按约 8 KiB 分页；这里留出 JSON-RPC 外层余量。
-DEFAULT_TOOL_PAGE_MAX_BYTES = 7 * 1024
-MAX_TOOL_PAGE_MAX_BYTES = 8 * 1024
+# 小智服务器目前可稳定接受约 32 KiB 的单条工具列表消息。
+DEFAULT_TOOL_PAGE_MAX_BYTES = 32 * 1024
+MAX_TOOL_PAGE_MAX_BYTES = 32 * 1024
 MIN_TOOL_PAGE_MAX_BYTES = 4 * 1024
-TOOL_DESCRIPTION_MAX_CHARS = 512
+TOOL_DESCRIPTION_MAX_CHARS = 96
 
 
 class ToolListPager:
@@ -87,7 +87,7 @@ class ToolListPager:
 
     @staticmethod
     def compact_tool(tool: object) -> dict:
-        """只压缩冗长说明，保留 inputSchema，避免破坏工具调用参数。"""
+        """压缩说明文字，但保留工具名、参数类型和必填字段。"""
         if not isinstance(tool, dict):
             return {}
 
@@ -97,7 +97,27 @@ class ToolListPager:
             compacted["description"] = (
                 description[:TOOL_DESCRIPTION_MAX_CHARS].rstrip() + "\n..."
             )
+
+        # HA MCP 的参数说明可能很长；删除 schema 内的文字元数据不会改变
+        # properties、type、required、enum 等实际调用结构。
+        if isinstance(compacted.get("inputSchema"), dict):
+            compacted["inputSchema"] = ToolListPager._compact_schema(
+                compacted["inputSchema"]
+            )
         return compacted
+
+    @staticmethod
+    def _compact_schema(value: object) -> object:
+        """递归移除 schema 的文字元数据，保留可执行的 JSON Schema 结构。"""
+        if isinstance(value, dict):
+            return {
+                key: ToolListPager._compact_schema(item)
+                for key, item in value.items()
+                if key not in {"description", "title", "examples"}
+            }
+        if isinstance(value, list):
+            return [ToolListPager._compact_schema(item) for item in value]
+        return value
 
     def _encode_response(
         self,
@@ -160,7 +180,7 @@ class ToolListPager:
                 self.max_bytes,
             )
         logger.info(
-            "Paginating tools/list: %d tools into %d page(s), largest %d bytes, max %d bytes",
+            "Preparing tools/list: %d tools into %d page(s), largest %d bytes, max %d bytes",
             len(tools),
             len(self.pages),
             largest_page,
