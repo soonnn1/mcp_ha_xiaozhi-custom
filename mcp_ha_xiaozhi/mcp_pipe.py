@@ -36,7 +36,137 @@ APP_OPTION_KEYS = (
     "HA_MCP_ENDPOINT",
     "API_ACCESS_TOKEN",
     "MCP_TRANSPORT",
+    "MCP_TOOL_PAGE_MAX_BYTES",
 )
+
+LOCAL_TOOL_CURSOR_PREFIX = "xiaozhi-page:"
+DEFAULT_TOOL_PAGE_MAX_BYTES = 256 * 1024
+TOOL_DESCRIPTION_MAX_CHARS = 512
+
+
+class ToolListPager:
+    """把 HA 返回的 tools/list 拆成小页，避免小智 WebSocket 触发 1009。"""
+
+    def __init__(self) -> None:
+        self.pages: list[list[dict]] = []
+        self.max_bytes = self._read_page_limit()
+
+    @staticmethod
+    def _read_page_limit() -> int:
+        """读取单页上限；默认 256 KiB，低于小智常见消息上限。"""
+        raw_value = os.environ.get(
+            "MCP_TOOL_PAGE_MAX_BYTES",
+            str(DEFAULT_TOOL_PAGE_MAX_BYTES),
+        )
+        try:
+            return max(32 * 1024, int(raw_value))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid MCP_TOOL_PAGE_MAX_BYTES=%r; using %d",
+                raw_value,
+                DEFAULT_TOOL_PAGE_MAX_BYTES,
+            )
+            return DEFAULT_TOOL_PAGE_MAX_BYTES
+
+    def reset(self) -> None:
+        """开始一次新的 tools/list 发现流程。"""
+        self.pages = []
+
+    @staticmethod
+    def compact_tool(tool: object) -> dict:
+        """只压缩冗长说明，保留 inputSchema，避免破坏工具调用参数。"""
+        if not isinstance(tool, dict):
+            return {}
+
+        compacted = dict(tool)
+        description = compacted.get("description")
+        if isinstance(description, str) and len(description) > TOOL_DESCRIPTION_MAX_CHARS:
+            compacted["description"] = (
+                description[:TOOL_DESCRIPTION_MAX_CHARS].rstrip() + "\n..."
+            )
+        return compacted
+
+    def _encode_response(
+        self,
+        request_id: object,
+        tools: list[dict],
+        next_cursor: str | None = None,
+    ) -> bytes:
+        result: dict[str, object] = {"tools": tools}
+        if next_cursor:
+            result["nextCursor"] = next_cursor
+        response = {"jsonrpc": "2.0", "id": request_id, "result": result}
+        return json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        )
+
+    def cache_tools(self, tools: list[object]) -> None:
+        """按完整工具对象分页，避免截断 JSON 或 inputSchema。"""
+        self.pages = []
+        current_page: list[dict] = []
+
+        for raw_tool in tools:
+            tool = self.compact_tool(raw_tool)
+            candidate = current_page + [tool]
+            if current_page and len(self._encode_response(None, candidate)) > self.max_bytes:
+                self.pages.append(current_page)
+                current_page = [tool]
+            else:
+                current_page = candidate
+
+        if current_page:
+            self.pages.append(current_page)
+
+        if not self.pages and tools:
+            # 极端情况下单个工具本身就超过上限，只能保留完整对象并记录警告。
+            self.pages = [[self.compact_tool(tools[0])]]
+
+        largest_page = max(
+            (len(self._encode_response(None, page)) for page in self.pages),
+            default=0,
+        )
+        if largest_page > self.max_bytes:
+            logger.warning(
+                "A single MCP tool page is %d bytes, above configured limit %d",
+                largest_page,
+                self.max_bytes,
+            )
+        logger.info(
+            "Paginating tools/list: %d tools into %d page(s), max %d bytes",
+            len(tools),
+            len(self.pages),
+            self.max_bytes,
+        )
+
+    def response_for(self, request_id: object, cursor: str | None = None) -> dict | None:
+        """根据小智返回的 cursor 构造下一页响应。"""
+        page_index = 0
+        if cursor:
+            if not cursor.startswith(LOCAL_TOOL_CURSOR_PREFIX):
+                return None
+            try:
+                page_index = int(cursor[len(LOCAL_TOOL_CURSOR_PREFIX) :])
+            except ValueError:
+                return None
+
+        if page_index < 0 or page_index >= len(self.pages):
+            return None
+
+        result: dict[str, object] = {"tools": self.pages[page_index]}
+        if page_index + 1 < len(self.pages):
+            result["nextCursor"] = f"{LOCAL_TOOL_CURSOR_PREFIX}{page_index + 1}"
+        return {"jsonrpc": "2.0", "id": request_id, "result": result}
+
+    def first_response(self, message: dict) -> dict:
+        """把 mcp-proxy 的完整 tools/list 响应替换成第一页。"""
+        result = message.get("result") or {}
+        tools = result.get("tools") if isinstance(result, dict) else None
+        if not isinstance(tools, list):
+            return message
+
+        self.cache_tools(tools)
+        response = self.response_for(message.get("id"))
+        return response or message
 
 
 def load_app_options(path: str = "/data/options.json") -> dict[str, str]:
@@ -142,9 +272,15 @@ async def connect_to_server(uri):
             logger.info("Started mcp-proxy process")
 
             # 任意一侧断开都要取消另外两个任务，避免外层 WebSocket 假在线。
+            tool_pager = ToolListPager()
+            send_lock = asyncio.Lock()
             tasks = {
-                asyncio.create_task(pipe_websocket_to_process(websocket, process)),
-                asyncio.create_task(pipe_process_to_websocket(process, websocket)),
+                asyncio.create_task(
+                    pipe_websocket_to_process(websocket, process, tool_pager, send_lock)
+                ),
+                asyncio.create_task(
+                    pipe_process_to_websocket(process, websocket, tool_pager, send_lock)
+                ),
                 asyncio.create_task(pipe_process_stderr_to_terminal(process)),
             }
             done, pending = await asyncio.wait(
@@ -176,7 +312,7 @@ async def connect_to_server(uri):
                 process.kill()
             logger.info("mcp-proxy process terminated")
 
-async def pipe_websocket_to_process(websocket, process):
+async def pipe_websocket_to_process(websocket, process, tool_pager, send_lock):
     """Read data from WebSocket and write to process stdin"""
     try:
         while True:
@@ -187,6 +323,28 @@ async def pipe_websocket_to_process(websocket, process):
             # Write to process stdin (in text mode)
             if isinstance(message, bytes):
                 message = message.decode('utf-8')
+
+            # 小智请求下一页时，直接从缓存响应，不再让 mcp-proxy 重复拉取整张工具表。
+            try:
+                request = json.loads(message)
+            except (TypeError, json.JSONDecodeError):
+                request = None
+
+            if isinstance(request, dict) and request.get("method") == "tools/list":
+                params = request.get("params") or {}
+                cursor = params.get("cursor") if isinstance(params, dict) else None
+                if cursor:
+                    response = tool_pager.response_for(request.get("id"), cursor)
+                    if response is not None:
+                        async with send_lock:
+                            await websocket.send(
+                                json.dumps(response, ensure_ascii=False, separators=(",", ":"))
+                            )
+                        continue
+                else:
+                    # 首次 tools/list 需要放行给 mcp-proxy，从 HA 获取工具目录。
+                    tool_pager.reset()
+
             process.stdin.write(message + '\n')
             process.stdin.flush()
     except Exception as e:
@@ -197,7 +355,7 @@ async def pipe_websocket_to_process(websocket, process):
         if not process.stdin.closed:
             process.stdin.close()
 
-async def pipe_process_to_websocket(process, websocket):
+async def pipe_process_to_websocket(process, websocket, tool_pager, send_lock):
     """Read data from process stdout and send to WebSocket"""
     try:
         while True:
@@ -210,10 +368,20 @@ async def pipe_process_to_websocket(process, websocket):
                 logger.info("Process has ended output")
                 break
 
-            # Send data to WebSocket
+            # tools/list 由桥接层分页后再发给小智，其他 JSON-RPC 消息原样转发。
             logger.debug(f">> {data[:120]}...")
-            # In text mode, data is already a string, no need to decode
-            await websocket.send(data)
+            try:
+                response = json.loads(data)
+            except (TypeError, json.JSONDecodeError):
+                response = None
+
+            result = response.get("result") if isinstance(response, dict) else None
+            if isinstance(result, dict) and isinstance(result.get("tools"), list):
+                response = tool_pager.first_response(response)
+                data = json.dumps(response, ensure_ascii=False, separators=(",", ":"))
+
+            async with send_lock:
+                await websocket.send(data)
     except Exception as e:
         logger.error(f"Error in process to WebSocket pipe: {e}")
         raise  # Re-throw exception to trigger reconnection
