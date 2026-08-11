@@ -45,6 +45,21 @@ DEFAULT_TOOL_PAGE_MAX_BYTES = 32 * 1024
 MAX_TOOL_PAGE_MAX_BYTES = 32 * 1024
 MIN_TOOL_PAGE_MAX_BYTES = 4 * 1024
 TOOL_DESCRIPTION_MAX_CHARS = 96
+MINIMAL_SCHEMA_KEYS = {
+    "$defs",
+    "$ref",
+    "additionalProperties",
+    "allOf",
+    "anyOf",
+    "const",
+    "enum",
+    "items",
+    "oneOf",
+    "properties",
+    "required",
+    "type",
+}
+MAX_ENUM_ITEMS = 32
 
 
 class ToolListPager:
@@ -113,11 +128,60 @@ class ToolListPager:
             return {
                 key: ToolListPager._compact_schema(item)
                 for key, item in value.items()
-                if key not in {"description", "title", "examples"}
+                if key not in {
+                    "description",
+                    "title",
+                    "examples",
+                    "default",
+                    "format",
+                    "pattern",
+                    "minLength",
+                    "maxLength",
+                    "minimum",
+                    "maximum",
+                    "multipleOf",
+                }
+                and not (
+                    key == "enum"
+                    and isinstance(item, list)
+                    and len(item) > MAX_ENUM_ITEMS
+                )
             }
         if isinstance(value, list):
             return [ToolListPager._compact_schema(item) for item in value]
         return value
+
+    @staticmethod
+    def _minimal_schema(value: object) -> object:
+        """生成极简 schema，让全部工具能在小智单页限制内发布。"""
+        if isinstance(value, dict):
+            compacted: dict[str, object] = {}
+            for key, item in value.items():
+                if key not in MINIMAL_SCHEMA_KEYS:
+                    continue
+                if key == "enum" and isinstance(item, list) and len(item) > MAX_ENUM_ITEMS:
+                    # 超长实体枚举会占满工具列表；调用时仍由 HA 校验实际值。
+                    continue
+                compacted[key] = ToolListPager._minimal_schema(item)
+            return compacted
+        if isinstance(value, list):
+            return [ToolListPager._minimal_schema(item) for item in value]
+        return value
+
+    @classmethod
+    def minimal_tool(cls, tool: object) -> dict:
+        """只保留工具调用必需字段，不改变工具名称或实际转发。"""
+        if not isinstance(tool, dict):
+            return {}
+        minimal: dict[str, object] = {"name": str(tool.get("name", ""))}
+        schema = tool.get("inputSchema")
+        minimal["inputSchema"] = cls._minimal_schema(
+            schema if isinstance(schema, dict) else {"type": "object"}
+        )
+        description = tool.get("description")
+        if isinstance(description, str) and TOOL_DESCRIPTION_MAX_CHARS > 0:
+            minimal["description"] = description[:TOOL_DESCRIPTION_MAX_CHARS].rstrip()
+        return minimal
 
     def _encode_response(
         self,
@@ -136,10 +200,31 @@ class ToolListPager:
     def cache_tools(self, tools: list[object]) -> None:
         """按完整工具对象分页，避免截断 JSON 或 inputSchema。"""
         self.pages = []
+        compacted_tools = [self.compact_tool(tool) for tool in tools]
+
+        # 优先把全部工具放进同一页，避免小智后台不继续请求 nextCursor。
+        if len(self._encode_response(None, compacted_tools)) <= self.max_bytes:
+            self.pages = [compacted_tools]
+            logger.info(
+                "Preparing tools/list: %d tools into 1 page(s), compacted list fits",
+                len(tools),
+            )
+            return
+
+        minimal_tools = [self.minimal_tool(tool) for tool in tools]
+        minimal_size = len(self._encode_response(None, minimal_tools))
+        if minimal_size <= self.max_bytes:
+            self.pages = [minimal_tools]
+            logger.info(
+                "Preparing tools/list: %d tools into 1 page(s), minimal schema %d bytes",
+                len(tools),
+                minimal_size,
+            )
+            return
+
         current_page: list[dict] = []
 
-        for raw_tool in tools:
-            tool = self.compact_tool(raw_tool)
+        for tool in compacted_tools:
             candidate = current_page + [tool]
             # 预留 nextCursor 的 JSON 空间，避免分页后的实际消息再次超限。
             probe_cursor = f"{LOCAL_TOOL_CURSOR_PREFIX}999999"
