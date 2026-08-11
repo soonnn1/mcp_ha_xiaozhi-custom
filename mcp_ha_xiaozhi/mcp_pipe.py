@@ -40,7 +40,10 @@ APP_OPTION_KEYS = (
 )
 
 LOCAL_TOOL_CURSOR_PREFIX = "xiaozhi-page:"
-DEFAULT_TOOL_PAGE_MAX_BYTES = 256 * 1024
+# 小智固件的 MCP 工具列表按约 8 KiB 分页；这里留出 JSON-RPC 外层余量。
+DEFAULT_TOOL_PAGE_MAX_BYTES = 7 * 1024
+MAX_TOOL_PAGE_MAX_BYTES = 8 * 1024
+MIN_TOOL_PAGE_MAX_BYTES = 4 * 1024
 TOOL_DESCRIPTION_MAX_CHARS = 512
 
 
@@ -53,13 +56,23 @@ class ToolListPager:
 
     @staticmethod
     def _read_page_limit() -> int:
-        """读取单页上限；默认 256 KiB，低于小智常见消息上限。"""
+        """读取单页上限，并强制限制在小智可接受的范围内。"""
         raw_value = os.environ.get(
             "MCP_TOOL_PAGE_MAX_BYTES",
             str(DEFAULT_TOOL_PAGE_MAX_BYTES),
         )
         try:
-            return max(32 * 1024, int(raw_value))
+            requested = int(raw_value)
+            if requested > MAX_TOOL_PAGE_MAX_BYTES:
+                logger.warning(
+                    "MCP_TOOL_PAGE_MAX_BYTES=%d is too large; clamping to %d",
+                    requested,
+                    MAX_TOOL_PAGE_MAX_BYTES,
+                )
+            return min(
+                MAX_TOOL_PAGE_MAX_BYTES,
+                max(MIN_TOOL_PAGE_MAX_BYTES, requested),
+            )
         except (TypeError, ValueError):
             logger.warning(
                 "Invalid MCP_TOOL_PAGE_MAX_BYTES=%r; using %d",
@@ -108,7 +121,11 @@ class ToolListPager:
         for raw_tool in tools:
             tool = self.compact_tool(raw_tool)
             candidate = current_page + [tool]
-            if current_page and len(self._encode_response(None, candidate)) > self.max_bytes:
+            # 预留 nextCursor 的 JSON 空间，避免分页后的实际消息再次超限。
+            probe_cursor = f"{LOCAL_TOOL_CURSOR_PREFIX}999999"
+            if current_page and len(
+                self._encode_response(None, candidate, probe_cursor)
+            ) > self.max_bytes:
                 self.pages.append(current_page)
                 current_page = [tool]
             else:
@@ -122,7 +139,18 @@ class ToolListPager:
             self.pages = [[self.compact_tool(tools[0])]]
 
         largest_page = max(
-            (len(self._encode_response(None, page)) for page in self.pages),
+            (
+                len(
+                    self._encode_response(
+                        None,
+                        page,
+                        f"{LOCAL_TOOL_CURSOR_PREFIX}{index + 1}"
+                        if index + 1 < len(self.pages)
+                        else None,
+                    )
+                )
+                for index, page in enumerate(self.pages)
+            ),
             default=0,
         )
         if largest_page > self.max_bytes:
@@ -132,9 +160,10 @@ class ToolListPager:
                 self.max_bytes,
             )
         logger.info(
-            "Paginating tools/list: %d tools into %d page(s), max %d bytes",
+            "Paginating tools/list: %d tools into %d page(s), largest %d bytes, max %d bytes",
             len(tools),
             len(self.pages),
+            largest_page,
             self.max_bytes,
         )
 
