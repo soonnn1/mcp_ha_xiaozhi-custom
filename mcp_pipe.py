@@ -12,6 +12,7 @@
 import asyncio
 import websockets
 import subprocess
+import json
 import logging
 import os
 import signal
@@ -30,6 +31,43 @@ INITIAL_BACKOFF = 1  # Initial wait time in seconds
 MAX_BACKOFF = 60  # Maximum wait time in seconds
 reconnect_attempt = 0
 backoff = INITIAL_BACKOFF
+APP_OPTION_KEYS = (
+    "XIAOZHI_MCP_ENDPOINT",
+    "HA_MCP_ENDPOINT",
+    "API_ACCESS_TOKEN",
+    "MCP_TRANSPORT",
+)
+
+
+def load_app_options(path: str = "/data/options.json") -> dict[str, str]:
+    """读取 Home Assistant App 页面保存的配置。"""
+    try:
+        with open(path, encoding="utf-8") as options_file:
+            raw_options = json.load(options_file)
+    except FileNotFoundError:
+        # 本程序也支持普通 Docker 运行，此时可以只使用环境变量。
+        return {}
+    except (OSError, json.JSONDecodeError) as error:
+        logger.warning("Unable to read Home Assistant app options: %s", error)
+        return {}
+
+    if not isinstance(raw_options, dict):
+        logger.warning("Home Assistant app options must be a JSON object")
+        return {}
+
+    return {
+        key: str(raw_options[key])
+        for key in APP_OPTION_KEYS
+        if raw_options.get(key) is not None
+    }
+
+
+def apply_app_options(options: dict[str, str]) -> None:
+    """将 App 配置覆盖到环境变量，供桥接程序和 mcp-proxy 使用。"""
+    for key, value in options.items():
+        # 空值保留 Docker/普通 Docker 运行时的环境变量回退值。
+        if value.strip():
+            os.environ[key] = value
 
 
 def normalize_endpoint(value: str, name: str) -> str:
@@ -59,7 +97,7 @@ def build_proxy_command(endpoint: str) -> list[str]:
     """构造 mcp-proxy 命令，并保留 API_ACCESS_TOKEN 环境变量认证。"""
     transport = resolve_transport(endpoint)
     command = ["mcp-proxy", "--transport", transport, endpoint]
-    logger.info("Starting mcp-proxy with %s transport: %s", transport, endpoint)
+    logger.info("Starting mcp-proxy with %s transport", transport)
     return command
 
 async def connect_with_retry(uri):
@@ -101,7 +139,7 @@ async def connect_to_server(uri):
                 stderr=subprocess.PIPE,
                 text=True  # Use text mode
             )
-            logger.info(f"Started {mcp_script} process")
+            logger.info("Started mcp-proxy process")
 
             # 任意一侧断开都要取消另外两个任务，避免外层 WebSocket 假在线。
             tasks = {
@@ -130,13 +168,13 @@ async def connect_to_server(uri):
     finally:
         # Ensure the child process is properly terminated
         if 'process' in locals():
-            logger.info(f"Terminating {mcp_script} process")
+            logger.info("Terminating mcp-proxy process")
             try:
                 process.terminate()
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 process.kill()
-            logger.info(f"{mcp_script} process terminated")
+            logger.info("mcp-proxy process terminated")
 
 async def pipe_websocket_to_process(websocket, process):
     """Read data from WebSocket and write to process stdin"""
@@ -208,6 +246,9 @@ def signal_handler(sig, frame):
 if __name__ == "__main__":
     # Register signal handler
     signal.signal(signal.SIGINT, signal_handler)
+
+    # Home Assistant App 的 UI 配置保存在 /data/options.json，不会自动注入环境变量。
+    apply_app_options(load_app_options())
 
     # mcp_script
     ha_endpoint_url = os.environ.get('HA_MCP_ENDPOINT')
