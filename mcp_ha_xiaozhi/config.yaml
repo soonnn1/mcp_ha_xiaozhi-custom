@@ -1,5 +1,5 @@
 name: 小智 MCP Server（新版）
-version: "1.0.0"
+version: "1.0.1"
 slug: mcp_ha_xiaozhi_custom
 description: 将小智官方 MCP 接入点连接到新版 Home Assistant MCP Server
 url: https://github.com/soonnn1/mcp_ha_xiaozhi-custom
