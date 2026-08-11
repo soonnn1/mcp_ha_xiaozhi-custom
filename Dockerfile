@@ -14,9 +14,9 @@ RUN pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
 COPY . .
 
 # 设置运行时环境变量（建议通过docker run注入敏感信息）
-ENV XIAOZHI_MCP_ENDPOINT=wss://api.xiaozhi.me/mcp/?token= \
+ENV XIAOZHI_MCP_ENDPOINT= \
     API_ACCESS_TOKEN= \
-    HA_MCP_ENDPOINT=http://homeassistant.local:8123/mcp_server/sse \
+    HA_MCP_ENDPOINT= \
     MCP_TRANSPORT=auto
 
 # 启动命令
