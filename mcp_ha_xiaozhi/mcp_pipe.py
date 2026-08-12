@@ -18,6 +18,7 @@ import os
 import signal
 import sys
 import random
+import re
 
 # Configure logging
 logging.basicConfig(
@@ -61,13 +62,100 @@ MINIMAL_SCHEMA_KEYS = {
     "type",
 }
 MAX_ENUM_ITEMS = 32
+SEARCH_RESULT_MAX_BYTES = 24 * 1024
+ROUTER_SEARCH_TOOL = "ha_search_tools"
+ROUTER_CALL_TOOL = "ha_call_tool"
+
+ROUTER_TOOLS = [
+    {
+        "name": ROUTER_SEARCH_TOOL,
+        "description": (
+            "在执行 Home Assistant 任务前先调用此工具。根据用户目标搜索全部 HA 工具目录，"
+            "返回最匹配工具的准确名称、完整用途、参数说明和必填字段。query 应描述要完成的动作和对象，"
+            "例如‘查询实体状态’、‘创建自动化’、‘管理插件’。不要猜测真实工具名。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "要完成的 Home Assistant 任务，可使用中文或英文并包含动作与对象。",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "返回候选数量，通常使用 3；复杂任务最多 8。",
+                    "minimum": 1,
+                    "maximum": 8,
+                    "default": 3,
+                },
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": ROUTER_CALL_TOOL,
+        "description": (
+            "执行 ha_search_tools 返回的真实 Home Assistant 工具。tool_name 必须逐字使用搜索结果中的名称，"
+            "arguments 必须遵循该结果的 inputSchema。除非已经知道准确名称和参数，否则先搜索再执行；"
+            "一个任务选定工具后不要继续尝试无关工具。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tool_name": {
+                    "type": "string",
+                    "description": "ha_search_tools 返回的真实 HA 工具名称。",
+                },
+                "arguments": {
+                    "type": "object",
+                    "description": "传给真实 HA 工具的参数对象，字段必须符合搜索结果中的 inputSchema。",
+                    "additionalProperties": True,
+                },
+            },
+            "required": ["tool_name", "arguments"],
+            "additionalProperties": False,
+        },
+    },
+]
+
+SEARCH_ALIASES = {
+    "灯": "light switch entity state turn on off",
+    "开关": "switch entity state turn on off",
+    "插座": "switch outlet entity state turn on off",
+    "空调": "climate temperature thermostat entity state",
+    "温度": "temperature climate sensor entity state",
+    "状态": "get entity state query",
+    "实体": "entity state device",
+    "设备": "device entity state",
+    "区域": "area floor",
+    "楼层": "floor area",
+    "自动化": "automation config",
+    "脚本": "script config",
+    "场景": "scene config",
+    "插件": "addon manage supervisor",
+    "蓝图": "blueprint import",
+    "日历": "calendar event",
+    "摄像头": "camera image",
+    "仪表盘": "dashboard config",
+    "能源": "energy prefs",
+    "助手": "helper config",
+    "删除": "remove delete",
+    "创建": "create set config",
+    "修改": "update set config manage",
+    "查询": "get list query",
+    "打开": "turn on enable",
+    "关闭": "turn off disable",
+}
 
 
 class ToolListPager:
-    """把 HA 返回的 tools/list 拆成小页，避免小智 WebSocket 触发 1009。"""
+    """缓存完整 HA 工具目录，并向小智提供轻量工具路由。"""
 
     def __init__(self) -> None:
         self.pages: list[list[dict]] = []
+        self.tools: list[dict] = []
+        self.tools_by_name: dict[str, dict] = {}
         self.max_bytes = self._read_page_limit()
 
     @staticmethod
@@ -100,6 +188,117 @@ class ToolListPager:
     def reset(self) -> None:
         """开始一次新的 tools/list 发现流程。"""
         self.pages = []
+        self.tools = []
+        self.tools_by_name = {}
+
+    @staticmethod
+    def _searchable_text(value: object) -> str:
+        """提取工具 schema 中有助于检索的字段名和说明。"""
+        if isinstance(value, dict):
+            parts: list[str] = []
+            for key, item in value.items():
+                if key in {"description", "properties", "required"}:
+                    parts.append(str(key))
+                    parts.append(ToolListPager._searchable_text(item))
+            return " ".join(parts)
+        if isinstance(value, list):
+            return " ".join(ToolListPager._searchable_text(item) for item in value)
+        return str(value)
+
+    @staticmethod
+    def _expand_query(query: str) -> str:
+        """补充常见中文智能家居词汇对应的 HA 英文检索词。"""
+        expanded = [query.lower()]
+        for chinese, english in SEARCH_ALIASES.items():
+            if chinese in query:
+                expanded.append(english)
+        return " ".join(expanded)
+
+    def search_tools(self, query: str, limit: int = 3) -> list[dict]:
+        """从完整目录中按名称、用途及参数语义检索真实工具。"""
+        expanded = self._expand_query(query.strip())
+        tokens = {
+            token
+            for token in re.findall(r"[\w.-]+|[\u4e00-\u9fff]+", expanded)
+            if len(token) > 1
+        }
+        ranked: list[tuple[int, str, dict]] = []
+        for tool in self.tools:
+            name = str(tool.get("name", "")).lower()
+            description = str(tool.get("description", "")).lower()
+            schema_text = self._searchable_text(tool.get("inputSchema", {})).lower()
+            score = 0
+            for token in tokens:
+                if token in name:
+                    score += 12
+                if token in description:
+                    score += 5
+                if token in schema_text:
+                    score += 2
+            if expanded and expanded in f"{name} {description}":
+                score += 20
+            if score:
+                ranked.append((score, name, tool))
+
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        return [tool for _, _, tool in ranked[:limit]]
+
+    @staticmethod
+    def call_result(request_id: object, payload: object, is_error: bool = False) -> dict:
+        """构造标准 MCP tools/call 文本结果。"""
+        text = payload if isinstance(payload, str) else json.dumps(
+            payload, ensure_ascii=False, separators=(",", ":")
+        )
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "content": [{"type": "text", "text": text}],
+                "isError": is_error,
+            },
+        }
+
+    def search_response(self, request_id: object, arguments: object) -> dict:
+        """本地执行工具搜索，并控制返回消息大小。"""
+        if not isinstance(arguments, dict) or not str(arguments.get("query", "")).strip():
+            return self.call_result(request_id, "query 不能为空", True)
+
+        query = str(arguments["query"]).strip()
+        try:
+            limit = min(8, max(1, int(arguments.get("limit", 3))))
+        except (TypeError, ValueError):
+            limit = 3
+        matches = self.search_tools(query, limit)
+        if not matches:
+            return self.call_result(
+                request_id,
+                {"query": query, "matches": [], "hint": "请换用更具体的动作或对象关键词。"},
+            )
+
+        result_tools: list[dict] = []
+        for tool in matches:
+            candidate = result_tools + [self.prepare_tool(tool)]
+            payload = {"query": query, "matches": candidate}
+            if len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) > SEARCH_RESULT_MAX_BYTES:
+                break
+            result_tools = candidate
+
+        if not result_tools:
+            result_tools = [self.minimal_tool(matches[0])]
+        logger.info(
+            "Tool search %r returned %d candidate(s): %s",
+            query,
+            len(result_tools),
+            ", ".join(str(tool.get("name", "")) for tool in result_tools),
+        )
+        return self.call_result(
+            request_id,
+            {
+                "query": query,
+                "matches": result_tools,
+                "instruction": "选择一个最匹配工具，然后用 ha_call_tool 执行。",
+            },
+        )
 
     @staticmethod
     def compact_tool(tool: object) -> dict:
@@ -251,57 +450,18 @@ class ToolListPager:
         )
 
     def cache_tools(self, tools: list[object]) -> None:
-        """按语义完整的工具对象分页，避免截断 JSON 或 inputSchema。"""
-        self.pages = []
-        prepared_tools = [self.prepare_tool(tool) for tool in tools]
-
-        current_page: list[dict] = []
-
-        for tool in prepared_tools:
-            candidate = current_page + [tool]
-            # 预留 nextCursor 的 JSON 空间，避免分页后的实际消息再次超限。
-            probe_cursor = f"{LOCAL_TOOL_CURSOR_PREFIX}999999"
-            if current_page and len(
-                self._encode_response(None, candidate, probe_cursor)
-            ) > self.max_bytes:
-                self.pages.append(current_page)
-                current_page = [tool]
-            else:
-                current_page = candidate
-
-        if current_page:
-            self.pages.append(current_page)
-
-        if not self.pages and tools:
-            self.pages = [[self.prepare_tool(tools[0])]]
-
-        largest_page = max(
-            (
-                len(
-                    self._encode_response(
-                        None,
-                        page,
-                        f"{LOCAL_TOOL_CURSOR_PREFIX}{index + 1}"
-                        if index + 1 < len(self.pages)
-                        else None,
-                    )
-                )
-                for index, page in enumerate(self.pages)
-            ),
-            default=0,
-        )
-        if largest_page > self.max_bytes:
-            logger.warning(
-                "A single MCP tool page is %d bytes, above configured limit %d",
-                largest_page,
-                self.max_bytes,
-            )
+        """保存 HA 完整目录；小智只需发现两个路由工具。"""
+        self.tools = [tool for tool in tools if isinstance(tool, dict)]
+        self.tools_by_name = {
+            str(tool.get("name")): tool
+            for tool in self.tools
+            if tool.get("name")
+        }
+        self.pages = [[dict(tool) for tool in ROUTER_TOOLS]]
         logger.info(
-            "Preparing semantic tools/list: %d tools into %d page(s), largest %d bytes, max %d bytes",
-            len(tools),
-            len(self.pages),
-            largest_page,
-            self.max_bytes,
+            "Tool router ready: %d HA tools cached, exposing %d router tools to XiaoZhi",
+            len(self.tools),
+            len(ROUTER_TOOLS),
         )
 
     def response_for(self, request_id: object, cursor: str | None = None) -> dict | None:
@@ -516,6 +676,58 @@ async def pipe_websocket_to_process(websocket, process, tool_pager, send_lock):
                 else:
                     # 首次 tools/list 需要放行给 mcp-proxy，从 HA 获取工具目录。
                     tool_pager.reset()
+
+            if isinstance(request, dict) and request.get("method") == "tools/call":
+                params = request.get("params") or {}
+                tool_name = params.get("name") if isinstance(params, dict) else None
+                arguments = params.get("arguments") if isinstance(params, dict) else None
+
+                if tool_name == ROUTER_SEARCH_TOOL:
+                    response = tool_pager.search_response(request.get("id"), arguments)
+                    async with send_lock:
+                        await websocket.send(
+                            json.dumps(response, ensure_ascii=False, separators=(",", ":"))
+                        )
+                    continue
+
+                if tool_name == ROUTER_CALL_TOOL:
+                    route_args = arguments if isinstance(arguments, dict) else {}
+                    target_name = str(route_args.get("tool_name", "")).strip()
+                    target_arguments = route_args.get("arguments")
+                    if target_name not in tool_pager.tools_by_name:
+                        response = tool_pager.call_result(
+                            request.get("id"),
+                            {
+                                "error": "未知的 HA 工具名称，请先调用 ha_search_tools。",
+                                "tool_name": target_name,
+                            },
+                            True,
+                        )
+                        async with send_lock:
+                            await websocket.send(
+                                json.dumps(response, ensure_ascii=False, separators=(",", ":"))
+                            )
+                        continue
+                    if not isinstance(target_arguments, dict):
+                        response = tool_pager.call_result(
+                            request.get("id"),
+                            "arguments 必须是 JSON 对象，请按照搜索结果的 inputSchema 传参。",
+                            True,
+                        )
+                        async with send_lock:
+                            await websocket.send(
+                                json.dumps(response, ensure_ascii=False, separators=(",", ":"))
+                            )
+                        continue
+
+                    request["params"] = {
+                        "name": target_name,
+                        "arguments": target_arguments,
+                    }
+                    message = json.dumps(
+                        request, ensure_ascii=False, separators=(",", ":")
+                    )
+                    logger.info("Routing XiaoZhi call to HA tool: %s", target_name)
 
             process.stdin.write(message + '\n')
             process.stdin.flush()
