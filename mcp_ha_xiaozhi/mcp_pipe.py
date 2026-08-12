@@ -63,16 +63,22 @@ MINIMAL_SCHEMA_KEYS = {
 }
 MAX_ENUM_ITEMS = 32
 SEARCH_RESULT_MAX_BYTES = 24 * 1024
-ROUTER_SEARCH_TOOL = "ha_search_tools"
-ROUTER_CALL_TOOL = "ha_call_tool"
+ROUTER_DISCOVER_TOOL = "ha_discover"
+ROUTER_HELP_TOOL = "ha_get_tool_help"
+ROUTER_EXECUTE_TOOL = "ha_execute"
+
+# 兼容已经缓存旧版工具列表的小智会话；旧名称不再暴露，但仍可继续调用。
+LEGACY_ROUTER_SEARCH_TOOL = "ha_search_tools"
+LEGACY_ROUTER_CALL_TOOL = "ha_call_tool"
 
 ROUTER_TOOLS = [
     {
-        "name": ROUTER_SEARCH_TOOL,
+        "name": ROUTER_DISCOVER_TOOL,
         "description": (
-            "在执行 Home Assistant 任务前先调用此工具。根据用户目标搜索全部 HA 工具目录，"
-            "返回最匹配工具的准确名称、完整用途、参数说明和必填字段。query 应描述要完成的动作和对象，"
-            "例如‘查询实体状态’、‘创建自动化’、‘管理插件’。不要猜测真实工具名。"
+            "Home Assistant 任务的第一步。根据用户目标发现相关 HA MCP 工具和推荐执行流程。"
+            "每个新任务先调用一次；复杂任务和失败恢复时可以带着新线索重复调用。返回结果后，"
+            "先用 ha_get_tool_help 查看准备调用工具的完整参数，再用 ha_execute 执行。"
+            "对于音乐、媒体等集成服务，本工具会给出 list_services/get_integration/call_service 的组合步骤。"
         ),
         "inputSchema": {
             "type": "object",
@@ -83,10 +89,14 @@ ROUTER_TOOLS = [
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "返回候选数量，通常使用 3；复杂任务最多 8。",
+                    "description": "返回候选数量，通常使用 5；复杂任务最多 8。",
                     "minimum": 1,
                     "maximum": 8,
-                    "default": 3,
+                    "default": 5,
+                },
+                "context": {
+                    "type": "string",
+                    "description": "可选。上一步结果、错误信息或已经知道的实体/服务名称，用于继续规划。",
                 },
             },
             "required": ["query"],
@@ -94,23 +104,46 @@ ROUTER_TOOLS = [
         },
     },
     {
-        "name": ROUTER_CALL_TOOL,
+        "name": ROUTER_HELP_TOOL,
         "description": (
-            "执行 ha_search_tools 返回的真实 Home Assistant 工具。tool_name 必须逐字使用搜索结果中的名称，"
-            "arguments 必须遵循该结果的 inputSchema。除非已经知道准确名称和参数，否则先搜索再执行；"
-            "一个任务选定工具后不要继续尝试无关工具。"
+            "读取一个真实 HA MCP 工具的完整用途、inputSchema、必填参数和关联提示。"
+            "tool_name 必须来自 ha_discover。调用 ha_execute 前应先读取帮助；参数错误时再次读取。"
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "tool_name": {
                     "type": "string",
-                    "description": "ha_search_tools 返回的真实 HA 工具名称。",
+                    "description": "ha_discover 返回的真实 HA MCP 工具名称。",
+                },
+            },
+            "required": ["tool_name"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": ROUTER_EXECUTE_TOOL,
+        "description": (
+            "执行真实 HA MCP 工具。tool_name 必须来自 ha_discover，arguments 必须严格符合"
+            "ha_get_tool_help 返回的 inputSchema。执行结果会回到当前对话；若任务尚未完成，"
+            "继续调用 ha_discover、ha_get_tool_help 或 ha_execute，直到得到最终结果。"
+            "不要猜参数；错误后根据错误内容修正，不要反复提交完全相同的调用。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tool_name": {
+                    "type": "string",
+                    "description": "要执行的真实 HA MCP 工具名称。",
                 },
                 "arguments": {
                     "type": "object",
-                    "description": "传给真实 HA 工具的参数对象，字段必须符合搜索结果中的 inputSchema。",
+                    "description": "传给真实工具的参数对象。",
                     "additionalProperties": True,
+                },
+                "purpose": {
+                    "type": "string",
+                    "description": "可选。说明本次调用要获得什么结果，帮助保持多步任务方向。",
                 },
             },
             "required": ["tool_name", "arguments"],
@@ -136,6 +169,17 @@ SEARCH_ALIASES = {
     "插件": "addon manage supervisor",
     "蓝图": "blueprint import",
     "日历": "calendar event",
+    "音乐": "music media player music_assistant service",
+    "歌曲": "music song track media music_assistant search service",
+    "歌手": "music artist track media music_assistant search service",
+    "专辑": "music album media music_assistant search service",
+    "歌单": "music playlist media music_assistant service",
+    "播放": "play media player music_assistant call service",
+    "暂停": "pause media player music_assistant call service",
+    "下一首": "next track media player music_assistant call service",
+    "广播": "radio media player music_assistant service",
+    "服务": "service list call",
+    "集成": "integration config entry",
     "摄像头": "camera image",
     "仪表盘": "dashboard config",
     "能源": "energy prefs",
@@ -149,6 +193,117 @@ SEARCH_ALIASES = {
 }
 
 
+# 不使用额外模型的确定性任务配方。DeepSeek 根据配方逐步调用真实 HA MCP 工具。
+TASK_RECIPES = [
+    {
+        "name": "music_assistant_media",
+        "triggers": (
+            "音乐", "歌曲", "歌手", "专辑", "歌单", "播放", "暂停", "下一首",
+            "music", "song", "track", "artist", "album", "playlist", "media",
+        ),
+        "tools": ("ha_list_services", "ha_get_integration", "ha_call_service", "ha_search"),
+        "workflow": (
+            "先用 ha_list_services 查询 music_assistant 域的服务；搜索歌曲不是 ha_search 的用途。",
+            "如果服务要求 config_entry_id，用 ha_get_integration 查找 music_assistant 的配置条目。",
+            "用 ha_call_service 调用 music_assistant.search；传入服务要求的 name、media_type 等数据并要求返回响应。",
+            "需要播放时，再查 media_player 实体并调用 music_assistant.play_media 或对应播放服务。",
+        ),
+    },
+    {
+        "name": "entity_control",
+        "triggers": (
+            "打开", "关闭", "开关", "灯", "插座", "空调", "调温", "亮度",
+            "turn on", "turn off", "light", "switch", "climate", "brightness",
+        ),
+        "tools": ("ha_search", "ha_get_state", "ha_call_service", "ha_bulk_control"),
+        "workflow": (
+            "用 ha_search 找到准确 entity_id。",
+            "必要时用 ha_get_state 确认当前状态和可用属性。",
+            "单个设备用 ha_call_service，多个设备用 ha_bulk_control。",
+        ),
+    },
+    {
+        "name": "entity_query",
+        "triggers": (
+            "状态", "温度", "湿度", "电量", "传感器", "历史", "查询实体",
+            "state", "temperature", "humidity", "battery", "sensor", "history",
+        ),
+        "tools": ("ha_search", "ha_get_state", "ha_get_entity", "ha_get_history"),
+        "workflow": (
+            "先用 ha_search 定位实体。",
+            "当前值用 ha_get_state，注册信息用 ha_get_entity，历史趋势用 ha_get_history。",
+        ),
+    },
+    {
+        "name": "automation_script_scene",
+        "triggers": (
+            "自动化", "脚本", "场景", "automation", "script", "scene",
+        ),
+        "tools": (
+            "ha_config_get_automation", "ha_config_set_automation",
+            "ha_config_get_script", "ha_config_set_script",
+            "ha_config_get_scene", "ha_config_set_scene", "ha_call_service",
+        ),
+        "workflow": (
+            "修改前先读取现有配置；创建或更新时使用对应 config_set 工具。",
+            "仅运行已有自动化、脚本或场景时，用 ha_call_service 触发。",
+        ),
+    },
+    {
+        "name": "calendar_todo",
+        "triggers": ("日历", "事件", "待办", "清单", "calendar", "event", "todo"),
+        "tools": (
+            "ha_config_get_calendar_events", "ha_config_set_calendar_event",
+            "ha_get_todo", "ha_set_todo_item", "ha_remove_todo_item",
+        ),
+        "workflow": (
+            "日历事件使用 calendar 配置工具；待办事项使用 todo 工具。",
+            "更新或删除前先查询准确的日历实体或待办项目标识。",
+        ),
+    },
+    {
+        "name": "integration_service",
+        "triggers": ("集成", "服务", "配置条目", "integration", "service", "config entry"),
+        "tools": ("ha_get_integration", "ha_list_services", "ha_call_service", "ha_set_integration"),
+        "workflow": (
+            "用 ha_get_integration 获取配置条目及其 ID。",
+            "用 ha_list_services 查看集成注册的服务和字段，再用 ha_call_service 调用。",
+        ),
+    },
+    {
+        "name": "addon_system",
+        "triggers": ("插件", "应用", "备份", "更新", "日志", "重启", "addon", "backup", "update", "log", "restart"),
+        "tools": (
+            "ha_get_addon", "ha_manage_addon", "ha_manage_backup", "ha_manage_updates",
+            "ha_get_logs", "ha_get_system_health", "ha_restart",
+        ),
+        "workflow": (
+            "先查询目标和当前状态，再执行管理操作。",
+            "重启、删除或恢复备份属于高影响操作，只有用户明确要求时执行。",
+        ),
+    },
+    {
+        "name": "dashboard_helper",
+        "triggers": ("仪表盘", "面板", "助手", "标签", "分组", "dashboard", "helper", "label", "group"),
+        "tools": (
+            "ha_config_get_dashboard", "ha_config_set_dashboard", "ha_config_list_helpers",
+            "ha_config_set_helper", "ha_config_get_label", "ha_config_set_label",
+            "ha_config_list_groups", "ha_config_set_group",
+        ),
+        "workflow": ("先读取现有配置和准确 ID，再使用对应 set 工具创建或修改。",),
+    },
+    {
+        "name": "camera_energy_area",
+        "triggers": ("摄像头", "图片", "能源", "楼层", "区域", "camera", "image", "energy", "floor", "area"),
+        "tools": (
+            "ha_get_camera_image", "ha_manage_energy_prefs", "ha_list_floors_areas",
+            "ha_set_area_or_floor",
+        ),
+        "workflow": ("先查询可用对象及 ID，再读取图片、能源设置或修改楼层区域。",),
+    },
+]
+
+
 class ToolListPager:
     """缓存完整 HA 工具目录，并向小智提供轻量工具路由。"""
 
@@ -156,6 +311,7 @@ class ToolListPager:
         self.pages: list[list[dict]] = []
         self.tools: list[dict] = []
         self.tools_by_name: dict[str, dict] = {}
+        self.pending_calls: dict[object, str] = {}
         self.max_bytes = self._read_page_limit()
 
     @staticmethod
@@ -244,6 +400,180 @@ class ToolListPager:
         return [tool for _, _, tool in ranked[:limit]]
 
     @staticmethod
+    def _clean_description(description: object, max_chars: int = 1200) -> str:
+        """移除每个 HA 工具重复携带的技能前言和声明，只保留实际用途。"""
+        if not isinstance(description, str):
+            return ""
+        cleaned = description.strip()
+        cleaned = re.sub(
+            r"^IMPORTANT:.*?SYMPTOMS:.*?\n\n",
+            "",
+            cleaned,
+            flags=re.DOTALL,
+        )
+        cleaned = cleaned.split("\n\nexec tool declaration:", 1)[0].strip()
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned[:max_chars].rstrip()
+
+    @staticmethod
+    def _required_fields(tool: dict) -> list[str]:
+        schema = tool.get("inputSchema")
+        required = schema.get("required") if isinstance(schema, dict) else None
+        return [str(item) for item in required] if isinstance(required, list) else []
+
+    @staticmethod
+    def _parameter_names(tool: dict) -> list[str]:
+        schema = tool.get("inputSchema")
+        properties = schema.get("properties") if isinstance(schema, dict) else None
+        return [str(item) for item in properties] if isinstance(properties, dict) else []
+
+    def tool_summary(self, tool: dict) -> dict:
+        """生成用于发现阶段的短摘要，完整 schema 由帮助工具按需返回。"""
+        return {
+            "name": str(tool.get("name", "")),
+            "summary": self._clean_description(tool.get("description"), 600),
+            "required": self._required_fields(tool),
+            "parameters": self._parameter_names(tool),
+        }
+
+    @staticmethod
+    def matching_recipes(query: str, context: str = "") -> list[dict]:
+        """按中英文意图词匹配无需模型参与的多步任务配方。"""
+        text = f"{query} {context}".lower()
+        ranked: list[tuple[int, str, dict]] = []
+        for recipe in TASK_RECIPES:
+            score = sum(1 for trigger in recipe["triggers"] if trigger.lower() in text)
+            if score:
+                ranked.append((score, str(recipe["name"]), recipe))
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        return [recipe for _, _, recipe in ranked[:3]]
+
+    def discover_response(self, request_id: object, arguments: object) -> dict:
+        """返回匹配的任务配方和工具摘要，引导 DeepSeek 继续循环调用。"""
+        if not isinstance(arguments, dict) or not str(arguments.get("query", "")).strip():
+            return self.call_result(
+                request_id,
+                {
+                    "ok": False,
+                    "error_code": "INVALID_QUERY",
+                    "error": "query 不能为空，请描述用户要完成的动作和对象。",
+                },
+                True,
+            )
+
+        query = str(arguments["query"]).strip()
+        context = str(arguments.get("context", "")).strip()
+        try:
+            limit = min(8, max(1, int(arguments.get("limit", 5))))
+        except (TypeError, ValueError):
+            limit = 5
+
+        recipes = self.matching_recipes(query, context)
+        selected_names: list[str] = []
+        recipe_payload: list[dict] = []
+        for recipe in recipes:
+            available_tools = [
+                name for name in recipe["tools"] if name in self.tools_by_name
+            ]
+            selected_names.extend(available_tools)
+            recipe_payload.append(
+                {
+                    "name": recipe["name"],
+                    "recommended_tools": available_tools,
+                    "workflow": list(recipe["workflow"]),
+                }
+            )
+
+        # 配方工具优先，随后补充目录语义检索结果。
+        search_query = f"{query} {context}".strip()
+        selected_names.extend(
+            str(tool.get("name", ""))
+            for tool in self.search_tools(search_query, max(limit * 2, 8))
+        )
+        unique_names: list[str] = []
+        for name in selected_names:
+            if name and name not in unique_names and name in self.tools_by_name:
+                unique_names.append(name)
+            if len(unique_names) >= limit:
+                break
+
+        candidates = [self.tool_summary(self.tools_by_name[name]) for name in unique_names]
+        if not candidates:
+            return self.call_result(
+                request_id,
+                {
+                    "ok": True,
+                    "query": query,
+                    "recipes": recipe_payload,
+                    "candidates": [],
+                    "next_action": (
+                        "换用动作、对象、集成域或错误中的英文名称再次调用 ha_discover；"
+                        "不要直接猜工具名。"
+                    ),
+                },
+            )
+
+        first_name = candidates[0]["name"]
+        logger.info(
+            "Capability discovery %r returned %d recipe(s) and %d tool(s): %s",
+            query,
+            len(recipe_payload),
+            len(candidates),
+            ", ".join(str(item["name"]) for item in candidates),
+        )
+        return self.call_result(
+            request_id,
+            {
+                "ok": True,
+                "query": query,
+                "recipes": recipe_payload,
+                "candidates": candidates,
+                "next_action": {
+                    "tool": ROUTER_HELP_TOOL,
+                    "arguments": {"tool_name": first_name},
+                    "instruction": (
+                        "查看准备执行工具的完整 schema。多步配方应按 workflow 顺序执行；"
+                        "每次拿到结果后判断任务是否完成，未完成就继续下一步。"
+                    ),
+                },
+            },
+        )
+
+    def help_response(self, request_id: object, arguments: object) -> dict:
+        """按名称返回单个真实工具的完整调用帮助。"""
+        route_args = arguments if isinstance(arguments, dict) else {}
+        tool_name = str(route_args.get("tool_name", "")).strip()
+        tool = self.tools_by_name.get(tool_name)
+        if tool is None:
+            return self.call_result(
+                request_id,
+                {
+                    "ok": False,
+                    "error_code": "UNKNOWN_TOOL",
+                    "error": "未知的 HA MCP 工具名称。",
+                    "tool_name": tool_name,
+                    "recovery": "调用 ha_discover 重新查找，不要猜测名称。",
+                },
+                True,
+            )
+
+        prepared = self.prepare_tool(tool)
+        prepared["description"] = self._clean_description(tool.get("description"), 3000)
+        logger.info("Serving full help for HA tool: %s", tool_name)
+        return self.call_result(
+            request_id,
+            {
+                "ok": True,
+                "tool": prepared,
+                "required": self._required_fields(tool),
+                "instruction": (
+                    "严格按 inputSchema 组织 arguments，然后调用 ha_execute。"
+                    "如果该工具返回列表或配置 ID，把结果用于配方的下一步，不要提前结束任务。"
+                ),
+            },
+        )
+
+    @staticmethod
     def call_result(request_id: object, payload: object, is_error: bool = False) -> dict:
         """构造标准 MCP tools/call 文本结果。"""
         text = payload if isinstance(payload, str) else json.dumps(
@@ -259,7 +589,7 @@ class ToolListPager:
         }
 
     def search_response(self, request_id: object, arguments: object) -> dict:
-        """本地执行工具搜索，并控制返回消息大小。"""
+        """兼容 1.0.9 已缓存会话的旧搜索协议。"""
         if not isinstance(arguments, dict) or not str(arguments.get("query", "")).strip():
             return self.call_result(request_id, "query 不能为空", True)
 
@@ -450,7 +780,7 @@ class ToolListPager:
         )
 
     def cache_tools(self, tools: list[object]) -> None:
-        """保存 HA 完整目录；小智只需发现两个路由工具。"""
+        """保存 HA 完整目录；小智只需发现三个代理路由工具。"""
         self.tools = [tool for tool in tools if isinstance(tool, dict)]
         self.tools_by_name = {
             str(tool.get("name")): tool
@@ -459,9 +789,101 @@ class ToolListPager:
         }
         self.pages = [[dict(tool) for tool in ROUTER_TOOLS]]
         logger.info(
-            "Tool router ready: %d HA tools cached, exposing %d router tools to XiaoZhi",
+            "Agentic tool router ready: %d HA tools cached, exposing %d loop tools to XiaoZhi",
             len(self.tools),
             len(ROUTER_TOOLS),
+        )
+
+    def enrich_routed_response(self, response: object) -> object:
+        """给真实工具错误追加恢复指引，帮助 DeepSeek 自主进入下一轮。"""
+        if not isinstance(response, dict):
+            return response
+        request_id = response.get("id")
+        target_name = self.pending_calls.pop(request_id, None)
+        if not target_name:
+            return response
+
+        if isinstance(response.get("error"), dict):
+            error = dict(response["error"])
+            data = error.get("data")
+            error["data"] = {
+                "original": data,
+                "executed_tool": target_name,
+                "recovery": (
+                    "读取错误中的字段要求，必要时调用 ha_get_tool_help；"
+                    "若选错工具则带着此错误重新调用 ha_discover。"
+                ),
+            }
+            response["error"] = error
+        else:
+            result = response.get("result")
+            if isinstance(result, dict) and result.get("isError"):
+                content = result.get("content")
+                if not isinstance(content, list):
+                    content = []
+                    result["content"] = content
+                content.append(
+                    {
+                        "type": "text",
+                        "text": json.dumps(
+                            {
+                                "executed_tool": target_name,
+                                "recovery": (
+                                    "不要原样重复失败调用。先根据错误修正参数；不确定参数时调用 "
+                                    "ha_get_tool_help，选错工具时调用 ha_discover 并把错误放入 context。"
+                                ),
+                            },
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                    }
+                )
+
+        encoded = json.dumps(
+            response, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        if len(encoded) <= self.max_bytes:
+            return response
+
+        # 只在单次执行结果超过小智 WebSocket 上限时裁剪，避免再次触发 1009。
+        original_result = response.get("result", response.get("error", {}))
+        original_text = json.dumps(
+            original_result, ensure_ascii=False, separators=(",", ":")
+        )
+        preview_chars = min(len(original_text), self.max_bytes // 2)
+        while preview_chars > 256:
+            bounded = self.call_result(
+                request_id,
+                {
+                    "ok": True,
+                    "executed_tool": target_name,
+                    "truncated": True,
+                    "preview": original_text[:preview_chars],
+                    "recovery": (
+                        "结果超过传输上限。继续任务时请使用更具体的查询、过滤器、字段投影或分页参数；"
+                        "不要把同一个宽泛调用原样重试。"
+                    ),
+                },
+            )
+            if len(json.dumps(bounded, ensure_ascii=False).encode("utf-8")) <= self.max_bytes:
+                logger.warning(
+                    "HA tool result from %s exceeded %d bytes; sending a bounded preview",
+                    target_name,
+                    self.max_bytes,
+                )
+                return bounded
+            preview_chars = int(preview_chars * 0.75)
+
+        return self.call_result(
+            request_id,
+            {
+                "ok": False,
+                "executed_tool": target_name,
+                "error_code": "RESULT_TOO_LARGE",
+                "error": "工具结果超过小智传输上限。",
+                "recovery": "改用更具体的查询、过滤器、字段投影或分页参数后继续。",
+            },
+            True,
         )
 
     def response_for(self, request_id: object, cursor: str | None = None) -> dict | None:
@@ -682,7 +1104,23 @@ async def pipe_websocket_to_process(websocket, process, tool_pager, send_lock):
                 tool_name = params.get("name") if isinstance(params, dict) else None
                 arguments = params.get("arguments") if isinstance(params, dict) else None
 
-                if tool_name == ROUTER_SEARCH_TOOL:
+                if tool_name == ROUTER_DISCOVER_TOOL:
+                    response = tool_pager.discover_response(request.get("id"), arguments)
+                    async with send_lock:
+                        await websocket.send(
+                            json.dumps(response, ensure_ascii=False, separators=(",", ":"))
+                        )
+                    continue
+
+                if tool_name == ROUTER_HELP_TOOL:
+                    response = tool_pager.help_response(request.get("id"), arguments)
+                    async with send_lock:
+                        await websocket.send(
+                            json.dumps(response, ensure_ascii=False, separators=(",", ":"))
+                        )
+                    continue
+
+                if tool_name == LEGACY_ROUTER_SEARCH_TOOL:
                     response = tool_pager.search_response(request.get("id"), arguments)
                     async with send_lock:
                         await websocket.send(
@@ -690,7 +1128,7 @@ async def pipe_websocket_to_process(websocket, process, tool_pager, send_lock):
                         )
                     continue
 
-                if tool_name == ROUTER_CALL_TOOL:
+                if tool_name in {ROUTER_EXECUTE_TOOL, LEGACY_ROUTER_CALL_TOOL}:
                     route_args = arguments if isinstance(arguments, dict) else {}
                     target_name = str(route_args.get("tool_name", "")).strip()
                     target_arguments = route_args.get("arguments")
@@ -698,8 +1136,11 @@ async def pipe_websocket_to_process(websocket, process, tool_pager, send_lock):
                         response = tool_pager.call_result(
                             request.get("id"),
                             {
-                                "error": "未知的 HA 工具名称，请先调用 ha_search_tools。",
+                                "ok": False,
+                                "error_code": "UNKNOWN_TOOL",
+                                "error": "未知的 HA MCP 工具名称。",
                                 "tool_name": target_name,
+                                "recovery": "调用 ha_discover 重新查找，不要猜测工具名。",
                             },
                             True,
                         )
@@ -711,7 +1152,14 @@ async def pipe_websocket_to_process(websocket, process, tool_pager, send_lock):
                     if not isinstance(target_arguments, dict):
                         response = tool_pager.call_result(
                             request.get("id"),
-                            "arguments 必须是 JSON 对象，请按照搜索结果的 inputSchema 传参。",
+                            {
+                                "ok": False,
+                                "error_code": "INVALID_ARGUMENTS",
+                                "error": "arguments 必须是 JSON 对象。",
+                                "recovery": (
+                                    "调用 ha_get_tool_help 查看该工具 inputSchema 后重新组织参数。"
+                                ),
+                            },
                             True,
                         )
                         async with send_lock:
@@ -727,7 +1175,12 @@ async def pipe_websocket_to_process(websocket, process, tool_pager, send_lock):
                     message = json.dumps(
                         request, ensure_ascii=False, separators=(",", ":")
                     )
-                    logger.info("Routing XiaoZhi call to HA tool: %s", target_name)
+                    tool_pager.pending_calls[request.get("id")] = target_name
+                    logger.info(
+                        "Agent loop executing HA tool: %s%s",
+                        target_name,
+                        f" ({route_args.get('purpose')})" if route_args.get("purpose") else "",
+                    )
 
             process.stdin.write(message + '\n')
             process.stdin.flush()
@@ -762,6 +1215,10 @@ async def pipe_process_to_websocket(process, websocket, tool_pager, send_lock):
             result = response.get("result") if isinstance(response, dict) else None
             if isinstance(result, dict) and isinstance(result.get("tools"), list):
                 response = tool_pager.first_response(response)
+            else:
+                response = tool_pager.enrich_routed_response(response)
+
+            if isinstance(response, dict):
                 data = json.dumps(response, ensure_ascii=False, separators=(",", ":"))
 
             async with send_lock:
