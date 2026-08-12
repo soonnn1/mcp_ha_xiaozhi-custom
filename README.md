@@ -20,6 +20,28 @@ MCP_TRANSPORT：`auto`、`sse` 或 `streamablehttp`，默认 `auto`
     * 访问你的 [Home Assistant 账户配置文件设置](https://my.home-assistant.io/redirect/profile)，进入“**安全**”选项卡。
     * 创建**长期访问令牌**。
 
+### 1.1.0 代理式工具路由
+
+本版本不再把全部 HA 工具压缩后直接发布给小智，也不需要额外的大模型。
+桥接器缓存 HA-MCP 的完整工具目录，只向小智后台的模型提供三个循环工具：
+
+- `ha_discover`：根据用户目标发现相关工具和推荐执行流程。
+- `ha_get_tool_help`：按需读取一个真实 HA 工具的完整参数结构。
+- `ha_execute`：执行真实 HA 工具，并把结果交回小智模型继续判断。
+
+复杂任务采用“发现 → 查看参数 → 执行 → 根据结果继续”的循环。例如搜索歌曲时，
+桥接器会明确引导模型依次查询 `music_assistant` 服务、获取集成配置条目，最后调用
+`music_assistant.search`，避免把歌曲搜索误判为普通 HA 实体搜索。
+
+启动成功后，日志应出现：
+
+```text
+Agentic tool router ready: 78 HA tools cached, exposing 3 loop tools to XiaoZhi
+```
+
+小智执行任务时，还会依次出现 `Capability discovery`、`Serving full help` 和
+`Agent loop executing HA tool`。这表示后台模型正在持续使用同一组工具结果完成多步任务。
+
 
 ### docker运行
 ```bash
@@ -47,3 +69,11 @@ docker run -d --name mcp_ha_xiaozhi \
 ```
 
 `HA_MCP_ENDPOINT` 末尾不要有空格。使用 `/private_xxx` 私密地址时，完整地址本身就是凭据，请不要公开。
+
+### 作为 Home Assistant 自定义应用安装
+
+1. 在 Home Assistant 的应用商店中添加本仓库地址：
+   `https://github.com/soonnn1/mcp_ha_xiaozhi-custom`
+2. 找到“小智 MCP Server（新版）”并安装。
+3. 在配置中填写小智 MCP 地址和 HA-MCP 私密地址。
+4. `MCP_TRANSPORT` 选择 `streamablehttp`，然后启动应用。
