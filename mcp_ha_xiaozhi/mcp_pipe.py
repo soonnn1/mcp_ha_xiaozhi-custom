@@ -44,7 +44,8 @@ LOCAL_TOOL_CURSOR_PREFIX = "xiaozhi-page:"
 DEFAULT_TOOL_PAGE_MAX_BYTES = 32 * 1024
 MAX_TOOL_PAGE_MAX_BYTES = 32 * 1024
 MIN_TOOL_PAGE_MAX_BYTES = 4 * 1024
-TOOL_DESCRIPTION_MAX_CHARS = 96
+FALLBACK_TOOL_DESCRIPTION_MAX_CHARS = 1024
+FALLBACK_PARAMETER_DESCRIPTION_MAX_CHARS = 512
 MINIMAL_SCHEMA_KEYS = {
     "$defs",
     "$ref",
@@ -102,19 +103,19 @@ class ToolListPager:
 
     @staticmethod
     def compact_tool(tool: object) -> dict:
-        """压缩说明文字，但保留工具名、参数类型和必填字段。"""
+        """保留工具语义，仅删除会异常膨胀工具列表的元数据。"""
         if not isinstance(tool, dict):
             return {}
 
-        compacted = dict(tool)
-        description = compacted.get("description")
-        if isinstance(description, str) and len(description) > TOOL_DESCRIPTION_MAX_CHARS:
-            compacted["description"] = (
-                description[:TOOL_DESCRIPTION_MAX_CHARS].rstrip() + "\n..."
-            )
-
-        # HA MCP 的参数说明可能很长；删除 schema 内的文字元数据不会改变
-        # properties、type、required、enum 等实际调用结构。
+        # 小智选工具只需要名称、用途和输入参数；输出 schema、图标等元数据
+        # 不参与调用决策，避免它们挤占 WebSocket 消息空间。
+        compacted = {
+            key: tool[key]
+            for key in ("name", "description", "inputSchema")
+            if key in tool
+        }
+        # 实体 ID 等动态枚举可能包含数百项，是工具消息过大的主要原因。
+        # 保留工具与参数说明，只移除超长枚举、示例和重复标题。
         if isinstance(compacted.get("inputSchema"), dict):
             compacted["inputSchema"] = ToolListPager._compact_schema(
                 compacted["inputSchema"]
@@ -123,23 +124,14 @@ class ToolListPager:
 
     @staticmethod
     def _compact_schema(value: object) -> object:
-        """递归移除 schema 的文字元数据，保留可执行的 JSON Schema 结构。"""
+        """递归保留参数语义，只移除高体积且不影响选工具的信息。"""
         if isinstance(value, dict):
             return {
                 key: ToolListPager._compact_schema(item)
                 for key, item in value.items()
                 if key not in {
-                    "description",
                     "title",
                     "examples",
-                    "default",
-                    "format",
-                    "pattern",
-                    "minLength",
-                    "maxLength",
-                    "minimum",
-                    "maximum",
-                    "multipleOf",
                 }
                 and not (
                     key == "enum"
@@ -149,6 +141,25 @@ class ToolListPager:
             }
         if isinstance(value, list):
             return [ToolListPager._compact_schema(item) for item in value]
+        return value
+
+    @staticmethod
+    def _truncate_schema_descriptions(value: object) -> object:
+        """单个工具过大时缩短参数说明，仍保留参数用途和调用结构。"""
+        if isinstance(value, dict):
+            compacted: dict[str, object] = {}
+            for key, item in value.items():
+                if key in {"title", "examples"}:
+                    continue
+                if key == "enum" and isinstance(item, list) and len(item) > MAX_ENUM_ITEMS:
+                    continue
+                if key == "description" and isinstance(item, str):
+                    compacted[key] = item[:FALLBACK_PARAMETER_DESCRIPTION_MAX_CHARS].rstrip()
+                    continue
+                compacted[key] = ToolListPager._truncate_schema_descriptions(item)
+            return compacted
+        if isinstance(value, list):
+            return [ToolListPager._truncate_schema_descriptions(item) for item in value]
         return value
 
     @staticmethod
@@ -179,9 +190,51 @@ class ToolListPager:
             schema if isinstance(schema, dict) else {"type": "object"}
         )
         description = tool.get("description")
-        if isinstance(description, str) and TOOL_DESCRIPTION_MAX_CHARS > 0:
-            minimal["description"] = description[:TOOL_DESCRIPTION_MAX_CHARS].rstrip()
+        if isinstance(description, str):
+            minimal["description"] = description[:FALLBACK_TOOL_DESCRIPTION_MAX_CHARS].rstrip()
         return minimal
+
+    def prepare_tool(self, tool: object) -> dict:
+        """为单个工具选择信息最完整、同时不超过消息上限的表示。"""
+        semantic = self.compact_tool(tool)
+        if len(self._encode_response(None, [semantic])) <= self.max_bytes:
+            return semantic
+
+        # 极少数工具自身包含很大的 schema；先缩短说明，不影响其他工具。
+        fallback = dict(semantic)
+        description = fallback.get("description")
+        if isinstance(description, str):
+            fallback["description"] = description[:FALLBACK_TOOL_DESCRIPTION_MAX_CHARS].rstrip()
+        schema = fallback.get("inputSchema")
+        if isinstance(schema, dict):
+            fallback["inputSchema"] = self._truncate_schema_descriptions(schema)
+        if len(self._encode_response(None, [fallback])) <= self.max_bytes:
+            logger.warning(
+                "Tool %s exceeded the page limit; parameter descriptions were shortened",
+                fallback.get("name", "<unnamed>"),
+            )
+            return fallback
+
+        # 最后兜底只影响这个超大工具，正常工具仍保留完整语义。
+        minimal = self.minimal_tool(tool)
+        if len(self._encode_response(None, [minimal])) <= self.max_bytes:
+            logger.warning(
+                "Tool %s still exceeded the page limit; using minimal schema for this tool only",
+                minimal.get("name", "<unnamed>"),
+            )
+            return minimal
+
+        # 理论上的异常兜底：确保任何单个工具都不会再次触发 WebSocket 1009。
+        emergency = {
+            "name": minimal.get("name", ""),
+            "description": str(minimal.get("description", ""))[:256],
+            "inputSchema": {"type": "object", "additionalProperties": True},
+        }
+        logger.warning(
+            "Tool %s has an exceptionally large schema; using an open schema for this tool only",
+            emergency["name"],
+        )
+        return emergency
 
     def _encode_response(
         self,
@@ -198,33 +251,13 @@ class ToolListPager:
         )
 
     def cache_tools(self, tools: list[object]) -> None:
-        """按完整工具对象分页，避免截断 JSON 或 inputSchema。"""
+        """按语义完整的工具对象分页，避免截断 JSON 或 inputSchema。"""
         self.pages = []
-        compacted_tools = [self.compact_tool(tool) for tool in tools]
-
-        # 优先把全部工具放进同一页，避免小智后台不继续请求 nextCursor。
-        if len(self._encode_response(None, compacted_tools)) <= self.max_bytes:
-            self.pages = [compacted_tools]
-            logger.info(
-                "Preparing tools/list: %d tools into 1 page(s), compacted list fits",
-                len(tools),
-            )
-            return
-
-        minimal_tools = [self.minimal_tool(tool) for tool in tools]
-        minimal_size = len(self._encode_response(None, minimal_tools))
-        if minimal_size <= self.max_bytes:
-            self.pages = [minimal_tools]
-            logger.info(
-                "Preparing tools/list: %d tools into 1 page(s), minimal schema %d bytes",
-                len(tools),
-                minimal_size,
-            )
-            return
+        prepared_tools = [self.prepare_tool(tool) for tool in tools]
 
         current_page: list[dict] = []
 
-        for tool in compacted_tools:
+        for tool in prepared_tools:
             candidate = current_page + [tool]
             # 预留 nextCursor 的 JSON 空间，避免分页后的实际消息再次超限。
             probe_cursor = f"{LOCAL_TOOL_CURSOR_PREFIX}999999"
@@ -240,8 +273,7 @@ class ToolListPager:
             self.pages.append(current_page)
 
         if not self.pages and tools:
-            # 极端情况下单个工具本身就超过上限，只能保留完整对象并记录警告。
-            self.pages = [[self.compact_tool(tools[0])]]
+            self.pages = [[self.prepare_tool(tools[0])]]
 
         largest_page = max(
             (
@@ -265,7 +297,7 @@ class ToolListPager:
                 self.max_bytes,
             )
         logger.info(
-            "Preparing tools/list: %d tools into %d page(s), largest %d bytes, max %d bytes",
+            "Preparing semantic tools/list: %d tools into %d page(s), largest %d bytes, max %d bytes",
             len(tools),
             len(self.pages),
             largest_page,
@@ -470,6 +502,12 @@ async def pipe_websocket_to_process(websocket, process, tool_pager, send_lock):
                 if cursor:
                     response = tool_pager.response_for(request.get("id"), cursor)
                     if response is not None:
+                        page_number = int(cursor[len(LOCAL_TOOL_CURSOR_PREFIX) :]) + 1
+                        logger.info(
+                            "Serving cached tools/list page %d/%d to XiaoZhi",
+                            page_number,
+                            len(tool_pager.pages),
+                        )
                         async with send_lock:
                             await websocket.send(
                                 json.dumps(response, ensure_ascii=False, separators=(",", ":"))
